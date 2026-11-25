@@ -1,75 +1,65 @@
-# Recommendation to unlearning
+# 推荐与遗忘接口约定
 
-设计评审稿 V8 · 2026-11-24
 
-本页描述推荐与遗忘模块的交接。现有类型与方法签名来自[共享接口协议](../contracts/INTERFACES.md)。拟议的适配能力和记录字段用于联调讨论。遗忘步骤见[遗忘算法设计](../modules/unlearning/DESIGN.md)。
+[团队文档目录](https://github.com/zhang-haichao/AfterRec/blob/main/docs/README.zh-CN.md) · [遗忘模块设计](../modules/unlearning/DESIGN.md)
 
-## 公共调用和数据对象
+## 1. 对接场景
 
-- 推荐到遗忘的入口为 `UnlearningMethod.unlearn(original, request, config) -> ModelArtifact`。`original` 是原模型产物，`request` 是已确认的遗忘请求，`config` 保存本次方法配置。`UnlearningMethod.is_compatible(model_name) -> bool` 提供模型类型的初步检查。
-- Retrain 通过 `Recommender.train(dataset, split, config) -> ModelArtifact` 调用推荐模块，在派生 Retain 划分上创建新模型。通过 `Recommender.load(artifact)` 核对新检查点是否可加载。
-- 现有 `Recommender.score_items(user_id, item_ids)` 提供固定候选打分。序列打分如需传固定历史或历史引用，由推荐与评测模块另行确认适配方式。
+- **提供方**为遗忘模块（B）。推荐模块提供 SASRec 的训练、加载和打分能力。
+- **使用方**为实验运行器和 B 模块页面。页面通过实验平台的 HTTP 接口发起任务并查询结果。
+- **用途**是在原 SASRec 已训练且遗忘请求已确认后，使用 Retain 从头训练，取得可重载的新模型引用。
 
-| 交接对象 | 现有字段与职责 |
-| --- | --- |
-| `DatasetRef`、`SplitRef` | 数据集 ID、版本、`split_id`、Train/Valid/Test 清单引用和种子。推荐模块提供原模型实际使用的版本和切分。 |
-| 原 `ModelArtifact` | `model_id`、`dataset_id`、`split_id`、`model_name`、`checkpoint_uri`、`id_mapping_uri`、`config`。推荐模块提供可加载的检查点和与之配套的映射。 |
-| `ForgetRequest` | `request_id`、`split_id`、`strategy`、`forget_manifest_uri`、`retain_manifest_uri`、`seed`。遗忘模块先按交互 ID 准备并确认清单。 |
-| 新 `ModelArtifact` | 包含新模型和检查点引用，并通过 `parent_model_id` 关联原模型，通过 `forget_request_id` 关联该次请求。 |
+## 2. 调用方式与输入输出
 
-`ForgetRequest.split_id` 指原训练切分。Retrain 的新产物可使用派生 Retain 切分 ID，运行记录保存派生切分与原切分的关联。SCIF 的新产物记录原检查点及实际使用的 Forget、清理后样本和 Retain 来源。
+**Python 调用**
 
-## 准备要求
+| 调用方向和方法 | 输入 | 输出 |
+| --- | --- | --- |
+| 运行器 → B · `UnlearningMethod.unlearn(original, request, config)` | 原 `ModelArtifact`、冻结的 `ForgetRequest`、方法配置 | 校验通过的新 `ModelArtifact` |
+| B → 推荐模块 · `Recommender.train(dataset, split, config)` | 原版本 `DatasetRef`、基于 Retain 的派生 `SplitRef`、从头训练配置 | 引用新检查点的 `ModelArtifact` |
+| B 或评测 → 推荐模块 · `Recommender.load(artifact)` | 指定模型的 `ModelArtifact` | 加载供后续打分，返回 `None` |
 
-1. 推荐模块提供原始训练交互及稳定的 `interaction_id`、`user_id`、`item_id`。序列训练还需能定位事件时间、稳定顺序、必要的会话边界和历史构造配置。
-2. 遗忘模块核对原产物、数据版本、切分和映射属于同一原实验。Forget 和 Retain 互斥且精确覆盖原 Train。确认后保存清单引用和摘要，运行前复核。
-3. 推荐模块从 Retain 重建训练输入，返回实际训练数据和派生样本的回执。序列样本应能追溯历史和目标的交互 ID。双塔应记录训练对、受影响的用户特征及必要的商品向量或索引版本。
-4. SCIF 所需适配能力包括原模型副本、与版本匹配的配置、目标参数、损失与梯度接口，以及受影响样本和 Retain 加载器。只有加载、更新和产物回读通过验证的组合才可接受执行。
+请求的 `split_id` 指 Original 的训练切分。派生切分的 Train 指向 `retain_manifest_uri`，Valid、Test 沿用原引用。首轮拟在运行记录中保存实际训练清单和序列样本来源的校验信息。B 复核数据版本、映射与清单，重载和打分通过后将产物交给评测与平台。发现输入不一致时结束本次运行并记录原因。 [共享接口协议](https://github.com/zhang-haichao/AfterRec/blob/main/docs/contracts/INTERFACES.md)
 
-## 结果、来源与失败信息
+**HTTP 调用（拟议）**
 
-执行成功后，推荐模块用返回的 `ModelArtifact` 重载新模型。遗忘模块保存实际输入摘要、方法配置和来源关系。实验平台用运行 ID 获取状态和产物，再把指定模型交给推荐、评测或模拟。产物记录及评测输入分别见[实验产物接口](EXPERIMENT_ARTIFACTS.md)和[模型与评测接口](MODEL_EVALUATION.md)。
+| 方法与路径 | 输入 | 输出 |
+| --- | --- | --- |
+| `POST /api/v1/unlearning-runs` | 原模型 ID `original_model_id`、已冻结的请求 ID `forget_request_id`、方法 `method`（首轮为 `retrain`） | `202 Accepted`，返回本次任务的 `run_id` 和状态 `status`（`pending`） |
+| `GET /api/v1/unlearning-runs/{run_id}` | 提交时返回的 `run_id` | 返回 `run_id` 和 `status`。成功时附新模型的 `model_id`，失败时返回 `error_message`。 |
 
-| 场景 | 返回信息 |
-| --- | --- |
-| 模型或方法不兼容 | 说明具体模型、方法及缺少的能力，例如 SCIF 梯度接口尚未验证。 |
-| 原产物、映射或清单不匹配 | 标识问题字段、预期版本与实际版本，保留失败运行的引用。 |
-| 求解失败或检查点无法加载 | 记录失败阶段和原因，保留已产生的诊断信息。 |
-| 产物可用且评测失败 | 返回已登记的模型引用和评测错误，允许沿用该模型单独重跑评测。 |
+POST 沿用团队规划的路径。后端按 ID 查找原模型和冻结请求，在后台调用 `unlearn()`。页面用 `run_id` 查询，状态从 `pending` 或 `running` 进入 `succeeded` 或 `failed`。查询路径和请求、响应字段待联调确认。 [前后端接口](https://github.com/zhang-haichao/AfterRec/blob/main/docs/interfaces/FRONTEND_BACKEND.md)
 
-同一划分可服务于 Retrain 和 SCIF 的对照。跨方法关联划分的 `selection_id`、固定历史引用 `history_ref` 及阶段回执字段均为拟议扩展。当前对照至少记录原模型、原切分和两份清单的哈希。字段进入公共类型前遵循[共享协议的变更流程](../contracts/INTERFACES.md)。
-
-## 示例
-
-以下 ID 和 URI 都是虚构示例。请求中的 `split-014` 是原切分。
+**SASRec 示例。** 页面用 `{"original_model_id":"sasrec-original-01","forget_request_id":"req-01","method":"retrain"}` 提交任务。后端按 `req-01` 找到下面的 `ForgetRequest`，并与原模型一起传给 B。示例中的 ID 和路径均为演示值。
 
 ```json
 {
-  "request_id": "req-014-R",
-  "split_id": "split-014",
+  "request_id": "req-01",
+  "split_id": "split-01",
   "strategy": "interaction",
-  "forget_manifest_uri": "requests/req-014-R/forget.jsonl",
-  "retain_manifest_uri": "requests/req-014-R/retain.jsonl",
+  "forget_manifest_uri": "requests/req-01/forget.jsonl",
+  "retain_manifest_uri": "requests/req-01/retain.jsonl",
   "seed": 2026
 }
 ```
 
-同一次 Retrain 的输出示例如下。`split-014-retain` 是训练使用的派生切分，`model-014` 是原模型。
+训练成功后，B 返回以下 `ModelArtifact`。`split-01-retain` 是实际训练的派生切分。示例 `config` 只列运行来源，实际产物还要保留推荐模块重载所需的模型配置。运行记录关联清单核对信息。
 
 ```json
 {
-  "model_id": "model-014-R",
-  "dataset_id": "agent-clicks",
-  "split_id": "split-014-retain",
+  "model_id": "sasrec-retrain-01",
+  "dataset_id": "clicks-01",
+  "split_id": "split-01-retain",
   "model_name": "SASRec",
-  "checkpoint_uri": "models/model-014-R/checkpoint.pt",
-  "id_mapping_uri": "datasets/agent-clicks/v1/id_mapping.json",
+  "checkpoint_uri": "models/sasrec-retrain-01/checkpoint.pt",
+  "id_mapping_uri": "datasets/clicks-01/v1/id_mapping.json",
   "config": {
     "method": "retrain",
     "fresh_initialization": true,
-    "source_split_id": "split-014"
+    "source_split_id": "split-01"
   },
-  "parent_model_id": "model-014",
-  "forget_request_id": "req-014-R"
+  "parent_model_id": "sasrec-original-01",
+  "forget_request_id": "req-01"
 }
 ```
+

@@ -1,74 +1,45 @@
-# Unlearning engine
+# 遗忘模块设计方案
 
-设计评审稿 V8 · 2026-11-24
+V9 · 2026-11-25 · **方案状态：草稿**
 
-## 范围与当前状态
+[团队文档目录](https://github.com/zhang-haichao/AfterRec/blob/main/docs/README.zh-CN.md)
 
-遗忘模块根据原模型和训练交互准备 Forget/Retain 清单，执行 Retrain 或 SCIF，并提供可追溯、可重新加载的新模型。推荐模块提供原训练数据、模型构建、训练和加载能力。静态评测使用新旧模型与固定协议进行比较。实验平台提交任务、查询进度和结果，Agent 模拟模块可使用已登记的模型进行后续模拟。
+## 1. 目标与范围
 
-首轮计划接入一个已确认的序列推荐模型，优先评估 SASRec。双塔沿用相同流程，按具体框架和模型结构单独验证。历史本地 BPR 小样本已覆盖请求冻结、全新重训、重载和 Recall/NDCG 对比。SASRec、双塔、SCIF 和平台联调属于待验证范围。公开仓库的当前接口状态见[共享接口协议](../../contracts/INTERFACES.md)。
+接收一个已训练的 SASRec、其原始数据切分和需要遗忘的点击，生成可重载、可追溯的新模型。首轮完成 SASRec Retrain，由静态评测模块对比原模型（Original）与重训模型（Retrain）。
 
-模型产物、遗忘请求和新模型的具体交接见[推荐与遗忘接口](../../interfaces/RECOMMENDATION_UNLEARNING.md)。
+- **请求准备。** 按原始点击 ID 形成并冻结 Forget（待删）和 Retain（保留）清单。
+- **方法执行。** 复用推荐模块的 SASRec，在 Retain 上从头训练，建立后续算法的对照基线。
+- **模型交付。** 校验并登记新检查点、ID 映射和来源，供评测与平台使用。
 
-## 遗忘请求与数据准备
+下一步用同一个 Original 和同一份遗忘划分验证 SCIF。双塔和平台集成在后续阶段安排。
 
-1. 选定原模型及其对应的数据版本和原始 Train/Valid/Test 划分。按稳定的交互 ID 从原 Train 选择 Forget，其余交互形成 Retain。比例抽样使用固定种子和确定的排序，数量向下取整。
-2. 校验 Forget 与 Retain 互斥，合起来恰好覆盖原 Train，验证集和测试集分别留作验证和评测。交互级遗忘按交互 ID 操作，同一商品的其他点击按各自 ID 判断。
-3. 确认时保存原模型、划分、方法、清单引用和哈希。执行前复核。比较 Retrain 与 SCIF 时，两次运行使用同一个原模型及内容完全相同的 Forget/Retain 清单。
-4. 保留原始点击 ID 与派生样本的对应关系。序列样本需要能追溯输入历史和预测目标的来源。来自 Agent 的点击随数据批次记录模拟来源，按用户和时间构造序列，时间相同时使用稳定的顺序字段。
+## 2. 整体流程与实现思路
 
-序列示例假设四次交互 `I1 → I2 → I3 → I4` 都属于同一用户的原 Train，最大历史长度至少为 3。遗忘 `I2` 后，从保留的原始交互重建训练样本。
+```mermaid
+flowchart LR
+    A["Original SASRec、原切分和待删点击"] --> B["冻结并校验 Forget / Retain"]
+    B --> C["用 Retain 重建序列，从头训练"]
+    C --> D["重载并登记新模型"]
+    D --> E["静态评测对比 Original 与 Retrain"]
+```
 
-| 原训练样本 | 遗忘 `I2` 后的样本 |
-| --- | --- |
-| `[I1] → I2` | 移除该目标样本 |
-| `[I1, I2] → I3` | `[I1] → I3` |
-| `[I1, I2, I3] → I4` | `[I1, I3] → I4` |
+1. **冻结请求。** B 从原 Train 校验待删点击，确认 Forget 与 Retain 互斥且合起来等于原 Train。记录原模型、数据版本、原切分和清单哈希，执行前复核。
+2. **重建并训练。** 推荐模块按原模型的时间顺序、窗口和 ID 映射，从 Retain 重建历史及下一商品标签。用相同模型结构、新权重和新优化器训练，Valid、Test 的目标沿用原划分。例中同一用户在原 Train 依次点击 `I1 → I2 → I3 → I4`，历史窗口至少为 3。遗忘点击 `I2` 后，`[I1] → I2` 消失，`[I1, I2, I3] → I4` 变成 `[I1, I3] → I4`。B 根据原始点击 ID 核对历史和标签两侧。如果训练入口使用预生成的序列，也要基于 Retain 重新生成。 [RecBole 序列构造](https://github.com/RUCAIBox/RecBole/blob/v1.2.1/recbole/data/dataset/sequential_dataset.py) · [MIT 许可](https://github.com/RUCAIBox/RecBole/blob/v1.2.1/LICENSE)
+3. **交付并对比。** B 验证新检查点可重载并打分，登记原模型、遗忘请求、实际训练输入和输出检查点。静态评测对两个模型使用相同的测试目标、历史、候选、过滤规则和 K。
 
-箭头左侧是输入历史，右侧是预测目标。验收时同时检查两侧的来源 ID。首个序列实验拟从 Retain 构造共同的评测历史，目标仍来自原 Test，每条历史只使用目标之前且符合协议的记录。
+本地 BPR 基线可复用请求冻结、清单校验和 Retrain 编排。首轮新增 SASRec 的 Retain 适配、训练输入审计与重载验证。后续 SCIF 从原检查点的副本出发，用删除前后受影响的样本和 Retain 更新部分参数。 [ERASE 的 SCIF 实现](https://github.com/deem-data/erase-bench/blob/42ea967ba56f9472cc0ea3b746f32e80153e1170/recbole/trainer/trainer.py#L3271)
 
-## Retrain 基线
+## 3. 模块依赖与对接
 
-Retrain 用相同模型结构、新权重和新优化器在 Retain 上重新训练，为同一原模型和同一划分下的近似方法提供对照。
+- **数据管理 → B。** 提供有版本的点击数据和固定划分，能够按点击 ID 找到用户、商品、时间及同时间下的稳定顺序。
+- **推荐模型 ↔ B。** 推荐模块提供 Original 检查点、配置和 ID 映射。B 交付 Retain 切分，推荐模块返回新检查点和实际训练输入记录，并提供重载与打分能力。 [推荐与遗忘接口](../../interfaces/RECOMMENDATION_UNLEARNING.md)
+- **B → 静态评测、平台。** 交付 Original 和 Retrain 的模型引用及请求关联。静态评测负责计算指标，平台消费模型与运行记录。推荐与评测模块需确认怎样向两个 SASRec 模型提供同一份历史。 [模型与评测接口](https://github.com/zhang-haichao/AfterRec/blob/main/docs/interfaces/MODEL_EVALUATION.md) · [实验产物接口](https://github.com/zhang-haichao/AfterRec/blob/main/docs/interfaces/EXPERIMENT_ARTIFACTS.md)
 
-1. 从 Retain 重建实际训练输入。序列模型重建历史前缀和下一物品标签。双塔重建训练对、受影响的用户特征和采样数据。
-2. 使用原实验的 ID 映射和可比的训练配置。记录配置差异、种子、实际训练数据及初始化信息。Valid/Test 目标沿用原划分。
-3. 生成独立检查点，核对实际 Retain 清单及派生输入哈希，验证原检查点未被修改。完成重载与打分检查后登记新模型。
-4. 双塔商品侧参数变化时重新生成商品向量，并在使用检索索引时保存与检查点对应的索引版本。
+## 4. 本阶段完成标准
 
-本地 BPR 基线可复用冻结请求、清单校验和 Retrain 运行编排。首个新模型需要接入推荐模块的实际预处理、模型构建、训练、加载及回执。
+1. 对同一原切分和冻结请求能复现 Forget/Retain。核对训练样本来源，所有待删点击均未进入重训历史或标签。
+2. 能用 Retain 从头训练 SASRec，生成独立检查点，通过推荐模块重载并打分，同时核对 Original 检查点的哈希未变。
+3. 能生成 Original 与 Retrain 的 Recall@K、NDCG@K 对照结果。两次评分使用同一评测协议，结果可回查模型、切分、遗忘请求和 K。指标记录推荐效用，数据删除由第 1 条的输入审计验证。
 
-## SCIF 近似遗忘
-
-SCIF 从原检查点的独立副本开始，结合遗忘和保留数据的梯度估计更新部分参数。首轮参考 ERASE 的 SCIF 实现，按模型和运行环境验证以下步骤。
-
-1. 按原始交互 ID 找出发生变化的训练样本，构造受影响的原始样本、清理后依然有效的样本及 Retain 加载器。以目标交互 ID 对照变化前后的序列，覆盖目标被删除、历史变短及截断窗口变化等情况。
-2. 对照 ERASE 的 `forget_data`、`clean_forget_data` 和 `retain_train_data`，核对输入格式、样本权重、补齐、截断、损失、负采样和归一化方式。SASRec 首先验证 ERASE 中选择的 `item_embedding.weight` 与实际模型兼容。双塔单独验证目标参数及梯度计算。
-3. 固定实现版本、目标参数、随机种子、阻尼和求解预算。在小样本上验证损失、梯度及更新后的权重均为有限值。
-4. 保存独立产物，记录输入和配置回执。重载通过后，用固定协议比较 Original、Retrain 和 SCIF。分别报告推荐效用、执行耗时和输入审计，成员推断等遗忘诊断按独立协议验证。
-
-## 兼容性与失败处理
-
-| 组合或情况 | 状态及处理 |
-| --- | --- |
-| BPR + Retrain | 已有历史本地验证，可作为接入和回归检查的参考。 |
-| SASRec 或双塔 + Retrain | 待验证从 Retain 重建输入、从头训练及产物重载，按模型实现分别验收。 |
-| SASRec 或双塔 + SCIF | 待核对检查点格式、模型版本、派生样本、目标参数和求解能力。兼容检查应说明缺少的能力。 |
-| 清单哈希变化、数据版本不一致或映射不匹配 | 拒绝本次执行，记录原因和对应输入引用。 |
-| SCIF 数值异常、超时或产物无法重载 | 按平台的 RunStatus 记录失败或取消及触发原因，区分计算异常与主动终止，保留诊断信息。经重载验收的产物才登记为可用。 |
-| 模型成功登记但评测失败 | 保留新模型，以同一模型和协议单独重试评测。执行重试使用新的运行 ID，沿用冻结清单。 |
-
-## 输出与验收顺序
-
-- 首先验证一组原始点击可以重复生成相同的 Forget/Retain，并通过上面的序列重建示例。
-- 然后验证首个新模型的 Retrain 产物。登记输出检查点、映射、原模型引用、请求引用、运行 ID，以及实际训练输入和初始化回执。
-- 接着验证 SCIF 的小样本更新和产物回读。先通过兼容检查，再开放该模型与方法的组合。
-- 最后用同一组用户、候选、历史、屏蔽规则和指标比较 Original、Retrain、SCIF，并检查平台侧任务查询与评测重试。结果格式见[模型与评测接口](../../interfaces/MODEL_EVALUATION.md)，保存与追溯见[实验产物接口](../../interfaces/EXPERIMENT_ARTIFACTS.md)。
-
-RecEraser 和 SISA 作为后续候选。它们需要在原训练阶段保存分片、子模型或分段检查点，进入开发前先与推荐模块确认训练准备、检查点格式和预测聚合方式。
-
-## 参考资料
-
-- [SASRec 论文](https://arxiv.org/abs/1808.09781) · [RecBole 序列数据构造](https://github.com/RUCAIBox/RecBole/blob/v1.2.1/recbole/data/dataset/sequential_dataset.py)
-- [SCIF 论文](https://www.sciencedirect.com/science/article/abs/pii/S0957417423015270) · [ERASE 实现与基准](https://github.com/deem-data/erase-bench)
-- [RecEraser 论文](https://arxiv.org/abs/2201.06820) · [SISA 论文](https://arxiv.org/abs/1912.03817)
+请求冻结和 Retrain 流程已有本地 BPR 小样本验证。以上三条是 SASRec 的待验收结果。
